@@ -1,0 +1,6 @@
+tmp/
+libdjabberd-rosterstorage-sqlite-perl/
+*.debhelper
+*.debhelper.log
+*.substvars
+files
