@@ -6,8 +6,8 @@ Build-Depends: debhelper (>= 5)
 Build-Depends-Indep: perl (>= 5.6.10-12), libdjabberd-perl (>= 0.85), libdbi-perl, libdbd-sqlite3-perl
 Standards-Version: 3.8.0
 Homepage: http://danga.com/djabberd
-Vcs-Git: git://github.com/djabberd/DJabberd-Authen-HTDigest.git
-Vcs-Browser: https://github.com/djabberd/DJabberd-Authen-HTDigest
+Vcs-Git: git://github.com/djabberd/DJabberd-RosterStorage-SQLite.git
+Vcs-Browser: https://github.com/djabberd/DJabberd-RosterStorage-S
 
 Package: libdjabberd-rosterstorage-sqlite-perl
 Section: perl
