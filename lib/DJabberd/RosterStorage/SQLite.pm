@@ -31,46 +31,113 @@ sub check_install_schema {
     my $self = shift;
     my $dbh = $self->{dbh};
 
-    eval {
-        $dbh->do(qq{
-            CREATE TABLE jidmap (
-                                 jidid INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                                 jid   VARCHAR(255) NOT NULL,
-                                 UNIQUE (jid)
-                                 )});
-        $dbh->do(qq{
-            CREATE TABLE roster (
-                                 userid        INTEGER REFERENCES jidmap NOT NULL,
-                                 contactid     INTEGER REFERENCES jidmap NOT NULL,
-                                 name          VARCHAR(255),
-                                 subscription  INTEGER NOT NULL REFERENCES substates DEFAULT 0,
-                                 PRIMARY KEY (userid, contactid)
-                                 )});
-        $dbh->do(qq{
-            CREATE TABLE rostergroup (
-                                      groupid       INTEGER PRIMARY KEY NOT NULL,
-                                      userid        INTEGER REFERENCES jidmap NOT NULL,
-                                      name          VARCHAR(255),
-                                      UNIQUE (userid, name)
-                                      )});
-        $dbh->do(qq{
-            CREATE TABLE groupitem (
-                                    groupid       INTEGER REFERENCES jidmap NOT NULL,
-                                    contactid     INTEGER REFERENCES jidmap NOT NULL,
-                                    PRIMARY KEY (groupid, contactid)
-                                    )});
-
-    };
-    if ($@ && $@ !~ /table \w+ already exists/) {
-        $logger->logdie("SQL error $@");
-        die "SQL error: $@\n";
+    my @schema = (
+        qq{ CREATE TABLE IF NOT EXISTS jidmap (
+                jidid           INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                jid             VARCHAR(255) NOT NULL,
+                                UNIQUE (jid)
+            )},
+        qq{ ALTER TABLE roster RENAME TO rosteritem },
+        qq{ CREATE TABLE IF NOT EXISTS rosteritem (
+                userid          INTEGER REFERENCES jidmap NOT NULL,
+                contactid       INTEGER REFERENCES jidmap NOT NULL,
+                name            VARCHAR(255),
+                subscription    INTEGER NOT NULL REFERENCES substates DEFAULT 0,
+                                PRIMARY KEY (userid, contactid)
+            )},
+        qq{ CREATE TABLE IF NOT EXISTS rostergroup (
+                groupid         INTEGER PRIMARY KEY NOT NULL,
+                userid          INTEGER REFERENCES jidmap NOT NULL,
+                name            VARCHAR(255),
+                                UNIQUE (userid, name)
+            )},
+        qq{ CREATE TABLE IF NOT EXISTS groupitem (
+                groupid         INTEGER REFERENCES jidmap NOT NULL,
+                contactid       INTEGER REFERENCES jidmap NOT NULL,
+                                PRIMARY KEY (groupid, contactid)
+            )},
+        qq{ CREATE TABLE IF NOT EXISTS journal (
+                entry           INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                userid          INTEGER REFERENCE jidmap NOT NULL,
+                contactid       INTEGER REFERENCE jidmap NOT NULL,
+                timestamp       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                operation       VARCHAR(255) NOT NULL,
+                                UNIQUE (entry)
+            )},
+        qq{ CREATE VIEW IF NOT EXISTS roster AS
+                SELECT r.userid as userid, r.contactid as contactid, name, subscription, jm.jid as user, jmc.jid as jid, ifnull(ver,0) as version
+                FROM
+                        rosteritem r
+                        INNER JOIN jidmap jm ON jm.jidid=r.userid
+                        INNER JOIN jidmap jmc ON jmc.jidid=r.contactid
+                        NATURAL LEFT OUTER JOIN
+                                (SELECT userid, contactid, max(entry) as ver FROM journal GROUP BY userid, contactid) rv
+                ORDER BY
+                        userid, version, contactid
+            },
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_add_item
+            INSTEAD OF INSERT ON roster
+            BEGIN
+                INSERT INTO journal(userid,contactid,operation) VALUES(NEW.userid,NEW.contactid,'INSERT '||ifnull(NEW.name,'<NULL>')||', '||NEW.subscription);
+                INSERT INTO rosteritem VALUES(NEW.userid, NEW.contactid, NEW.name, NEW.subscription);
+            END},
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_upd_item
+            INSTEAD OF UPDATE ON roster
+            BEGIN
+                INSERT INTO journal(userid,contactid,operation) VALUES(NEW.userid,NEW.contactid,'UPDATE '||ifnull(OLD.name,'<NULL>')||' '||OLD.subscription);
+                UPDATE rosteritem SET name=NEW.name, subscription=NEW.subscription WHERE userid=OLD.userid AND contactid=OLD.contactid;
+            END},
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_rem_item
+            INSTEAD OF DELETE ON roster
+            WHEN OLD.subscription < 256
+            BEGIN
+                INSERT INTO journal(userid,contactid,operation) VALUES(OLD.userid,OLD.contactid,'DELETE '||ifnull(OLD.name,'<NULL>')||' '||OLD.subscription);
+                UPDATE rosteritem SET subscription = subscription + 256 WHERE userid = OLD.userid AND contactid = OLD.contactid;
+            END},
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_del_item
+            INSTEAD OF DELETE ON roster
+            WHEN OLD.subscription > 255
+            BEGIN
+                DELETE FROM rosteritem WHERE userid=OLD.userid AND contactid=OLD.contactid;
+            END},
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_add_grp
+            AFTER INSERT ON groupitem
+            BEGIN
+                INSERT INTO journal(userid,contactid,operation) SELECT userid,NEW.contactid,'GRPADD '||name FROM rostergroup WHERE groupid = NEW.groupid;
+            END},
+        qq{ CREATE TRIGGER IF NOT EXISTS roster_ver_del_grp
+            AFTER DELETE ON groupitem
+            BEGIN
+                INSERT INTO journal(userid,contactid,operation) SELECT userid,OLD.contactid,'GRPDEL '||name FROM rostergroup WHERE groupid = OLD.groupid;
+            END},
+    );
+    foreach my$sql(@schema) {
+        eval { $dbh->do($sql); };
+        if ($@ && $@ !~ /no such table: roster|there is already another table or index with this name: rosteritem/) {
+            $logger->logdie("SQL error $@ for $sql");
+            die "SQL error: $@\n";
+        }
     }
+    # Purge on start. Feel free to do it more frequently
+    $dbh->do("DELETE FROM rosteritem WHERE ROWID IN (SELECT r.ROWID FROM rosteritem r NATURAL JOIN journal WHERE r.subscription=0 AND datetime(timestamp,'+3 days') > datetime('now'))");
 
     $logger->info("Created all roster tables");
 
 }
 
 sub blocking { 1 }
+
+sub register {
+    my $self = shift;
+    my $vhost = shift;
+    $self->SUPER::register($vhost);
+    $vhost->register_hook('SendFeatures',sub {
+        my ($vh, $cb, $conn) = @_;
+        # Add rosterver feature as per [RFC-6121 2.6.1]
+        return $cb->stanza("<ver xmlns='urn:xmpp:features:rosterver'/>") if(!$conn->is_server && $conn->sasl && $conn->sasl->authenticated_jid);
+        $cb->decline;
+    });
+}
 
 sub get_roster {
     my ($self, $cb, $jid) = @_;
@@ -83,9 +150,9 @@ sub get_roster {
     my $roster = DJabberd::Roster->new;
 
     my $sql = qq{
-        SELECT r.contactid, r.name, r.subscription, jmc.jid
-        FROM roster r, jidmap jm, jidmap jmc
-        WHERE r.userid=jm.jidid and jm.jid=? and jmc.jidid=r.contactid
+        SELECT contactid, name, subscription, jid, version
+        FROM roster
+        WHERE user=?
     };
 
     # contacts is { contactid -> $row_hashref }
@@ -94,11 +161,13 @@ sub get_roster {
     };
     $logger->logdie("Failed to load roster: $@") if $@;
 
-    foreach my $contact (values %$contacts) {
+    foreach my $contact (sort{$a->{version} <=> $b->{version} or $a->{contactid} <=> $b->{contactid}}values %$contacts) {
         my $item =
           DJabberd::RosterItem->new(
                                     jid          => $contact->{jid},
                                     name         => $contact->{name},
+                                    remove       => ($contact->{subscription} & 0x100),
+                                    ver          => $contact->{version},
                                     subscription => DJabberd::Subscription->from_bitmask($contact->{subscription}),
                                     );
 
@@ -329,7 +398,7 @@ sub load_roster_item {
         return;
     }
 
-    my $row = $dbh->selectrow_hashref("SELECT name, subscription FROM roster ".
+    my $row = $dbh->selectrow_hashref("SELECT name, subscription, version FROM roster ".
                                       "WHERE userid=? AND contactid=?",
                                       undef, $userid, $contactid);
     unless ($row) {
@@ -341,6 +410,8 @@ sub load_roster_item {
         DJabberd::RosterItem->new(
                                   jid          => $contact_jid,,
                                   name         => $row->{name},
+                                  remove       => ($row->{subscription} & 0x100),
+                                  ver          => $row->{version},
                                   subscription => DJabberd::Subscription->from_bitmask($row->{subscription}),
                                   );
     foreach my $ga ($self->_groups_of_contactid($userid, $contactid)) {
@@ -430,3 +501,7 @@ This is free software. IT COMES WITHOUT WARRANTY OF ANY KIND.
 Brad Fitzpatrick <brad@danga.com>
 
 Artur Bergman <sky@crucially.net>
+
+Ruslan N Marchenko <me@ruff.mobi>
+=cut
+# vim: sts=4 et ai:
