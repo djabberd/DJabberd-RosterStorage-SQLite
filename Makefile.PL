@@ -6,7 +6,7 @@ WriteMakefile(
               VERSION_FROM => 'lib/DJabberd/RosterStorage/SQLite.pm',
               ABSTRACT_FROM => 'lib/DJabberd/RosterStorage/SQLite.pm',
               PREREQ_PM    => {
-                  'DJabberd'                => '0.80',
+                  'DJabberd'                => '0.90',
                   'DBD::SQLite'             => '1.08',
                   'DBI',                    => 0,
               },
