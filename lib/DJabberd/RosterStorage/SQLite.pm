@@ -9,7 +9,7 @@ use DJabberd::Log;
 our $logger = DJabberd::Log->get_logger();
 
 use vars qw($_respect_subscription $VERSION);
-$VERSION = '1.00';
+$VERSION = '1.01';
 
 sub set_config_database {
     my ($self, $dbfile) = @_;
